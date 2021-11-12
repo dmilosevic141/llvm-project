@@ -138,6 +138,17 @@ cl::opt<unsigned> llvm::SetLicmMssaNoAccForPromotionCap(
              "number of accesses allowed to be present in a loop in order to "
              "enable memory promotion."));
 
+// Experimental option which allows the LICM pass to promote conditional
+// accesses of loop-invariant locations.
+// The load instructions will be hoisted into the preheader, while the store
+// instructions will be sunk into the exit blocks, where they will be executed
+// conditionally, depending on whether or not the control flow actually got to
+// them.
+cl::opt<bool> SetLicmConditionalAccessPromotion(
+    "licm-conditional-access-promotion", cl::Hidden, cl::init(false),
+    cl::desc("Enable promotion of conditional accesses of loop-invariant "
+             "locations"));
+
 static bool inSubLoop(BasicBlock *BB, Loop *CurLoop, LoopInfo *LI);
 static bool isNotUsedOrFreeInLoop(const Instruction &I, const Loop *CurLoop,
                                   const LoopSafetyInfo *SafetyInfo,
@@ -1775,12 +1786,19 @@ class LoopPromoter : public LoadAndStorePromoter {
   PredIteratorCache &PredCache;
   MemorySSAUpdater &MSSAU;
   LoopInfo &LI;
+  DominatorTree &DT;
   DebugLoc DL;
   Align Alignment;
   bool UnorderedAtomic;
   AAMDNodes AATags;
   ICFLoopSafetyInfo &SafetyInfo;
   bool CanInsertStoresInExitBlocks;
+  bool PromoteConditionalAccesses;
+  // This flag will be used to make sure that every sinken, conditional store
+  // instruction is executed conditionally within the exit blocks. In the
+  // preheader, it is initialized to 0. In every basic block containing a
+  // conditional store it is raised.
+  SSAUpdater *FlagSSAUpdater;
 
   // We're about to add a use of V in a loop exit block.  Insert an LCSSA phi
   // (if legal) if doing so would add an out-of-loop use to an instruction
@@ -1805,15 +1823,19 @@ public:
                SmallVectorImpl<BasicBlock *> &LEB,
                SmallVectorImpl<Instruction *> &LIP,
                SmallVectorImpl<MemoryAccess *> &MSSAIP, PredIteratorCache &PIC,
-               MemorySSAUpdater &MSSAU, LoopInfo &li, DebugLoc dl,
-               Align Alignment, bool UnorderedAtomic, const AAMDNodes &AATags,
-               ICFLoopSafetyInfo &SafetyInfo, bool CanInsertStoresInExitBlocks)
+               MemorySSAUpdater &MSSAU, LoopInfo &li, DominatorTree &dt,
+               DebugLoc dl, Align Alignment, bool UnorderedAtomic,
+               const AAMDNodes &AATags, ICFLoopSafetyInfo &SafetyInfo,
+               bool CanInsertStoresInExitBlocks,
+               bool PromoteConditionalAccesses, SSAUpdater *FlagSSAUpdater)
       : LoadAndStorePromoter(Insts, S), SomePtr(SP), PointerMustAliases(PMA),
         LoopExitBlocks(LEB), LoopInsertPts(LIP), MSSAInsertPts(MSSAIP),
-        PredCache(PIC), MSSAU(MSSAU), LI(li), DL(std::move(dl)),
+        PredCache(PIC), MSSAU(MSSAU), LI(li), DT(dt), DL(std::move(dl)),
         Alignment(Alignment), UnorderedAtomic(UnorderedAtomic), AATags(AATags),
         SafetyInfo(SafetyInfo),
-        CanInsertStoresInExitBlocks(CanInsertStoresInExitBlocks) {}
+        CanInsertStoresInExitBlocks(CanInsertStoresInExitBlocks),
+        PromoteConditionalAccesses(PromoteConditionalAccesses),
+        FlagSSAUpdater(FlagSSAUpdater) {}
 
   bool isInstInList(Instruction *I,
                     const SmallVectorImpl<Instruction *> &) const override {
@@ -1853,9 +1875,53 @@ public:
         NewMemAcc =
             MSSAU.createMemoryAccessAfter(NewSI, nullptr, MSSAInsertPoint);
       }
-      MSSAInsertPts[i] = NewMemAcc;
+      // If we promote a conditional access, the insert position will be reset
+      // to the first instruction in the exit block, after all the PHIs and
+      // LandingPad instructions. This means that the next store being sunk will
+      // be inserted at the beginning of the exit basic block.
+      if (!PromoteConditionalAccesses)
+        MSSAInsertPts[i] = NewMemAcc;
+      else
+        MSSAInsertPts[i] = nullptr;
       MSSAU.insertDef(cast<MemoryDef>(NewMemAcc), true);
       // FIXME: true for safety, false may still be correct.
+      if (PromoteConditionalAccesses) {
+        Value *FlagValue = FlagSSAUpdater->GetValueInMiddleOfBlock(ExitBlock);
+        const auto &Name = SomePtr->getName();
+        // Split the exit basic block in half. The split point is the new store
+        // instruction just inserted.
+        BasicBlock *ThenBB = SplitBlock(ExitBlock, NewSI, &DT, &LI, &MSSAU,
+                                        Name + ".flag.then.bb");
+        // The new basic block starts with the new store instruction. We need to
+        // isolate the new store instruction in a separate "then" basic block.
+        // The split point is the InsertPos, which is the successor instruction
+        // of the new store instruction.
+        BasicBlock *ElseBB = SplitBlock(ThenBB, InsertPos, &DT, &LI, &MSSAU,
+                                        Name + ".flag.else.bb");
+        // The split exit block now unconditionally branches to the "then" basic
+        // block. We need to do that conditionally, depending on the flag's
+        // value.
+        Instruction *OldTerminator = ExitBlock->getTerminator();
+        ICmpInst *NewICmpInst = new ICmpInst(
+            OldTerminator, CmpInst::Predicate::ICMP_EQ, FlagValue,
+            ConstantInt::get(
+                Type::getInt1Ty(ExitBlock->getParent()->getContext()),
+                /* Value */ 1),
+            "tobool." + Name + ".flag");
+        BranchInst *NewTerminator =
+            BranchInst::Create(ThenBB, ElseBB, NewICmpInst);
+        ReplaceInstWithInst(OldTerminator, NewTerminator);
+        // Update the dominator tree with the added edge to the "else" basic
+        // block.
+        DT.insertEdge(ExitBlock, ElseBB);
+        // Update the MemorySSA with the added edge to the "else" basic block.
+        SmallVector<CFGUpdate, 1> Update;
+        Update.push_back({cfg::UpdateKind::Insert, ExitBlock, ElseBB});
+        MSSAU.applyInsertUpdates(Update, DT);
+        if (VerifyMemorySSA)
+          MSSAU.getMemorySSA()->verifyMemorySSA();
+        LoopInsertPts[i] = &*ExitBlock->getFirstInsertionPt();
+      }
     }
   }
 
@@ -2009,6 +2075,9 @@ bool llvm::promoteLoopAccessesToScalars(
   bool SawNotAtomic = false;
   AAMDNodes AATags;
 
+  bool SawConditionalLIStore = false;
+  StringRef PointerOperandName;
+
   const DataLayout &MDL = Preheader->getModule()->getDataLayout();
 
   if (SafetyInfo->anyBlockMayThrow()) {
@@ -2080,6 +2149,12 @@ bool llvm::promoteLoopAccessesToScalars(
           DereferenceableInPH = true;
           if (StoreSafety == StoreSafetyUnknown)
             StoreSafety = StoreSafe;
+          Alignment = std::max(Alignment, InstAlignment);
+        } else if (SetLicmConditionalAccessPromotion &&
+                    (!SawConditionalLIStore || (InstAlignment > Alignment))) {
+          SawConditionalLIStore = true;
+          if (PointerOperandName.empty())
+            PointerOperandName = Store->getPointerOperand()->getName();
           Alignment = std::max(Alignment, InstAlignment);
         }
 
@@ -2157,6 +2232,31 @@ bool llvm::promoteLoopAccessesToScalars(
     // If we cannot hoist the load either, give up.
     return false;
 
+  const bool PromoteConditionalAccesses = SetLicmConditionalAccessPromotion &&
+                                          (StoreSafety != StoreSafe) &&
+                                          SawConditionalLIStore;
+  SmallVector<PHINode *, 16> FlagPHIs;
+  SSAUpdater FlagSSAUpdater(&FlagPHIs);
+  SSAUpdater *FlagSSAUpdaterPtr = nullptr;
+  if (PromoteConditionalAccesses) {
+    // There are only conditional store instructions to the location within the
+    // loop.
+    StoreSafety = StoreSafe;
+    Type *Int1Ty = Type::getInt1Ty(Preheader->getParent()->getContext());
+    FlagSSAUpdater.Initialize(Int1Ty, PointerOperandName.str() + ".flag");
+    // Initialize the flag with 0 in the preheader.
+    FlagSSAUpdater.AddAvailableValue(Preheader,
+                                     ConstantInt::get(Int1Ty,
+                                                      /* Value */ 0));
+    for (auto *UI : LoopUses)
+      if (StoreInst *ConditionalLIStore = dyn_cast<StoreInst>(UI))
+        // Raise the flag if a conditional store happened.
+        FlagSSAUpdater.AddAvailableValue(ConditionalLIStore->getParent(),
+                                         ConstantInt::get(Int1Ty,
+                                                          /* Value */ 1));
+    FlagSSAUpdaterPtr = &FlagSSAUpdater;
+  }
+
   // Lets do the promotion!
   if (StoreSafety == StoreSafe)
     LLVM_DEBUG(dbgs() << "LICM: Promoting load/store of the value: " << *SomePtr
@@ -2182,9 +2282,10 @@ bool llvm::promoteLoopAccessesToScalars(
   SmallVector<PHINode *, 16> NewPHIs;
   SSAUpdater SSA(&NewPHIs);
   LoopPromoter Promoter(SomePtr, LoopUses, SSA, PointerMustAliases, ExitBlocks,
-                        InsertPts, MSSAInsertPts, PIC, MSSAU, *LI, DL,
+                        InsertPts, MSSAInsertPts, PIC, MSSAU, *LI, *DT, DL,
                         Alignment, SawUnorderedAtomic, AATags, *SafetyInfo,
-                        StoreSafety == StoreSafe);
+                        StoreSafety == StoreSafe, PromoteConditionalAccesses,
+                        FlagSSAUpdaterPtr);
 
   // Set up the preheader to have a definition of the value.  It is the live-out
   // value from the preheader that uses in the loop will use.
