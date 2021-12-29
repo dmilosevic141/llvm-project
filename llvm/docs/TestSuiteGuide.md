@@ -289,6 +289,13 @@ Example usage:
   % test-suite/utils/compare.py base0.json base1.json base2.json vs exp0.json exp1.json exp2.json
   ```
 
+- Compare two result files and plot the mean values and the most differing test results:
+
+  ```bash
+  % test-suite/utils/compare.py results-pre-patch.json results-post-path.json -plot
+  ```
+  ![Plot](test-suite-guide-plot.png)
+
 ### Continuous Tracking with LNT
 
 LNT is a set of client and server tools for continuously monitoring
