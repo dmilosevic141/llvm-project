@@ -68,6 +68,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/PatternMatch.h"
@@ -137,6 +138,17 @@ cl::opt<unsigned> llvm::SetLicmMssaNoAccForPromotionCap(
              "effect. When MSSA in LICM is enabled, then this is the maximum "
              "number of accesses allowed to be present in a loop in order to "
              "enable memory promotion."));
+
+// Experimental option which allows the LICM pass to promote conditional
+// accesses of loop-invariant locations.
+// The load instructions will be hoisted into the preheader, while the store
+// instructions will be sunk into the exit blocks, where they will be executed
+// conditionally, depending on whether or not the control flow actually got to
+// them.
+cl::opt<bool> SetLicmConditionalAccessPromotion(
+    "licm-conditional-access-promotion", cl::Hidden, cl::init(false),
+    cl::desc("Enable promotion of conditional accesses of loop-invariant "
+             "locations"));
 
 static bool inSubLoop(BasicBlock *BB, Loop *CurLoop, LoopInfo *LI);
 static bool isNotUsedOrFreeInLoop(const Instruction &I, const Loop *CurLoop,
@@ -1781,6 +1793,12 @@ class LoopPromoter : public LoadAndStorePromoter {
   AAMDNodes AATags;
   ICFLoopSafetyInfo &SafetyInfo;
   bool CanInsertStoresInExitBlocks;
+  bool PromoteConditionalAccesses;
+  // This flag will be used to make sure that every sinken, conditional store
+  // instruction is executed conditionally within the exit blocks. In the
+  // preheader, it is initialized to 0. In every basic block containing a
+  // conditional store it is raised.
+  SSAUpdater *FlagSSAUpdater;
 
   // We're about to add a use of V in a loop exit block.  Insert an LCSSA phi
   // (if legal) if doing so would add an out-of-loop use to an instruction
@@ -1807,13 +1825,16 @@ public:
                SmallVectorImpl<MemoryAccess *> &MSSAIP, PredIteratorCache &PIC,
                MemorySSAUpdater &MSSAU, LoopInfo &li, DebugLoc dl,
                Align Alignment, bool UnorderedAtomic, const AAMDNodes &AATags,
-               ICFLoopSafetyInfo &SafetyInfo, bool CanInsertStoresInExitBlocks)
+               ICFLoopSafetyInfo &SafetyInfo, bool CanInsertStoresInExitBlocks,
+               bool PromoteConditionalAccesses, SSAUpdater *FlagSSAUpdater)
       : LoadAndStorePromoter(Insts, S), SomePtr(SP), PointerMustAliases(PMA),
         LoopExitBlocks(LEB), LoopInsertPts(LIP), MSSAInsertPts(MSSAIP),
         PredCache(PIC), MSSAU(MSSAU), LI(li), DL(std::move(dl)),
         Alignment(Alignment), UnorderedAtomic(UnorderedAtomic), AATags(AATags),
         SafetyInfo(SafetyInfo),
-        CanInsertStoresInExitBlocks(CanInsertStoresInExitBlocks) {}
+        CanInsertStoresInExitBlocks(CanInsertStoresInExitBlocks),
+        PromoteConditionalAccesses(PromoteConditionalAccesses),
+        FlagSSAUpdater(FlagSSAUpdater) {}
 
   bool isInstInList(Instruction *I,
                     const SmallVectorImpl<Instruction *> &) const override {
@@ -1836,26 +1857,42 @@ public:
       LiveInValue = maybeInsertLCSSAPHI(LiveInValue, ExitBlock);
       Value *Ptr = maybeInsertLCSSAPHI(SomePtr, ExitBlock);
       Instruction *InsertPos = LoopInsertPts[i];
-      StoreInst *NewSI = new StoreInst(LiveInValue, Ptr, InsertPos);
-      if (UnorderedAtomic)
-        NewSI->setOrdering(AtomicOrdering::Unordered);
-      NewSI->setAlignment(Alignment);
-      NewSI->setDebugLoc(DL);
-      if (AATags)
-        NewSI->setAAMetadata(AATags);
+      if (!PromoteConditionalAccesses) {
+        StoreInst *NewSI = new StoreInst(LiveInValue, Ptr, InsertPos);
+        if (UnorderedAtomic)
+          NewSI->setOrdering(AtomicOrdering::Unordered);
+        NewSI->setAlignment(Alignment);
+        NewSI->setDebugLoc(DL);
+        if (AATags)
+          NewSI->setAAMetadata(AATags);
 
-      MemoryAccess *MSSAInsertPoint = MSSAInsertPts[i];
-      MemoryAccess *NewMemAcc;
-      if (!MSSAInsertPoint) {
-        NewMemAcc = MSSAU.createMemoryAccessInBB(
-            NewSI, nullptr, NewSI->getParent(), MemorySSA::Beginning);
+        MemoryAccess *MSSAInsertPoint = MSSAInsertPts[i];
+        MemoryAccess *NewMemAcc;
+        if (!MSSAInsertPoint) {
+          NewMemAcc = MSSAU.createMemoryAccessInBB(
+              NewSI, nullptr, NewSI->getParent(), MemorySSA::Beginning);
+        } else {
+          NewMemAcc =
+              MSSAU.createMemoryAccessAfter(NewSI, nullptr, MSSAInsertPoint);
+        }
+        MSSAInsertPts[i] = NewMemAcc;
+        MSSAU.insertDef(cast<MemoryDef>(NewMemAcc), true);
+        // FIXME: true for safety, false may still be correct.
       } else {
-        NewMemAcc =
-            MSSAU.createMemoryAccessAfter(NewSI, nullptr, MSSAInsertPoint);
+        Value *FlagValue = FlagSSAUpdater->GetValueInMiddleOfBlock(ExitBlock);
+        IRBuilder<> Builder(InsertPos);
+        Type *LiveInValueType = LiveInValue->getType();
+        Type *DataType = VectorType::get(LiveInValueType, 1, false);
+        Value *V = UndefValue::get(DataType);
+        V = Builder.CreateInsertElement(V, LiveInValue, uint64_t(0));
+        Value *P =
+            Builder.CreatePointerCast(Ptr, PointerType::getUnqual(DataType));
+        Type *MaskType =
+            VectorType::get(Type::getInt1Ty(ExitBlock->getContext()), 1, false);
+        Value *M = UndefValue::get(MaskType);
+        M = Builder.CreateInsertElement(M, FlagValue, uint64_t(0));
+        Builder.CreateMaskedStore(V, P, Alignment, M);
       }
-      MSSAInsertPts[i] = NewMemAcc;
-      MSSAU.insertDef(cast<MemoryDef>(NewMemAcc), true);
-      // FIXME: true for safety, false may still be correct.
     }
   }
 
@@ -2009,6 +2046,9 @@ bool llvm::promoteLoopAccessesToScalars(
   bool SawNotAtomic = false;
   AAMDNodes AATags;
 
+  bool SawConditionalLIStore = false;
+  StringRef PointerOperandName;
+
   const DataLayout &MDL = Preheader->getModule()->getDataLayout();
 
   if (SafetyInfo->anyBlockMayThrow()) {
@@ -2080,6 +2120,12 @@ bool llvm::promoteLoopAccessesToScalars(
           DereferenceableInPH = true;
           if (StoreSafety == StoreSafetyUnknown)
             StoreSafety = StoreSafe;
+          Alignment = std::max(Alignment, InstAlignment);
+        } else if (SetLicmConditionalAccessPromotion &&
+                    (!SawConditionalLIStore || (InstAlignment > Alignment))) {
+          SawConditionalLIStore = true;
+          if (PointerOperandName.empty())
+            PointerOperandName = Store->getPointerOperand()->getName();
           Alignment = std::max(Alignment, InstAlignment);
         }
 
@@ -2157,6 +2203,31 @@ bool llvm::promoteLoopAccessesToScalars(
     // If we cannot hoist the load either, give up.
     return false;
 
+  const bool PromoteConditionalAccesses = SetLicmConditionalAccessPromotion &&
+                                          (StoreSafety != StoreSafe) &&
+                                          SawConditionalLIStore;
+  SmallVector<PHINode *, 16> FlagPHIs;
+  SSAUpdater FlagSSAUpdater(&FlagPHIs);
+  SSAUpdater *FlagSSAUpdaterPtr = nullptr;
+  if (PromoteConditionalAccesses) {
+    // There are only conditional store instructions to the location within the
+    // loop.
+    StoreSafety = StoreSafe;
+    Type *Int1Ty = Type::getInt1Ty(Preheader->getParent()->getContext());
+    FlagSSAUpdater.Initialize(Int1Ty, PointerOperandName.str() + ".flag");
+    // Initialize the flag with 0 in the preheader.
+    FlagSSAUpdater.AddAvailableValue(Preheader,
+                                     ConstantInt::get(Int1Ty,
+                                                      /* Value */ 0));
+    for (auto *UI : LoopUses)
+      if (StoreInst *ConditionalLIStore = dyn_cast<StoreInst>(UI))
+        // Raise the flag if a conditional store happened.
+        FlagSSAUpdater.AddAvailableValue(ConditionalLIStore->getParent(),
+                                         ConstantInt::get(Int1Ty,
+                                                          /* Value */ 1));
+    FlagSSAUpdaterPtr = &FlagSSAUpdater;
+  }
+
   // Lets do the promotion!
   if (StoreSafety == StoreSafe)
     LLVM_DEBUG(dbgs() << "LICM: Promoting load/store of the value: " << *SomePtr
@@ -2184,7 +2255,8 @@ bool llvm::promoteLoopAccessesToScalars(
   LoopPromoter Promoter(SomePtr, LoopUses, SSA, PointerMustAliases, ExitBlocks,
                         InsertPts, MSSAInsertPts, PIC, MSSAU, *LI, DL,
                         Alignment, SawUnorderedAtomic, AATags, *SafetyInfo,
-                        StoreSafety == StoreSafe);
+                        StoreSafety == StoreSafe, PromoteConditionalAccesses,
+                        FlagSSAUpdaterPtr);
 
   // Set up the preheader to have a definition of the value.  It is the live-out
   // value from the preheader that uses in the loop will use.
