@@ -20,5 +20,6 @@ using namespace llvm;
 /// initializeLoopDuplicationOpts - Initialize all passes linked into the
 /// LoopDuplicationOpts library.
 void llvm::initializeLoopDuplicationOpts(PassRegistry &Registry) {
+  initializeLegacyLASBCPassPass(Registry);
   initializeLegacyLoopConditionalLICMPassPass(Registry);
 }

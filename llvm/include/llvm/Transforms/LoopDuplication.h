@@ -23,6 +23,13 @@ class Pass;
 
 //===----------------------------------------------------------------------===//
 //
+// LASBC - This pass adds array subscript bound checking to allow additional
+// loop optimizations.
+//
+Pass *createLASBCPass();
+
+//===----------------------------------------------------------------------===//
+//
 // Loop Conditional LICM - ...
 //
 Pass *createLoopConditionalLICMPass();

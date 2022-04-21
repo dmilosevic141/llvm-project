@@ -1,4 +1,5 @@
 add_llvm_component_library(LLVMLoopDuplicationOpts
+  LASBC.cpp
   LoopConditionalLICM.cpp
   LoopDuplication.cpp
   LoopDuplicationPass.cpp
