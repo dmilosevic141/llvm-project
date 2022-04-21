@@ -22,6 +22,7 @@ add_llvm_component_library(LLVMPasses
   InstCombine
   ObjCARC
   Scalar
+  LoopDuplication
   Support
   Target
   TransformUtils

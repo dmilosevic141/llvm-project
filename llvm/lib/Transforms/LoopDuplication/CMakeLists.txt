@@ -1,4 +1,6 @@
 add_llvm_component_library(LLVMLoopDuplicationOpts
+  LoopConditionalLICM.cpp
+  LoopDuplication.cpp
   LoopDuplicationPass.cpp
 
   ADDITIONAL_HEADER_DIRS

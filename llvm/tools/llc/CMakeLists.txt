@@ -13,6 +13,7 @@ set(LLVM_LINK_COMPONENTS
   MIRParser
   Remarks
   ScalarOpts
+  LoopDuplicationOpts
   SelectionDAG
   Support
   Target

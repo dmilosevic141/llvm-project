@@ -19,6 +19,7 @@ set(LLVM_LINK_COMPONENTS
   MC
   ObjCARCOpts
   ScalarOpts
+  LoopDuplicationOpts
   Support
   Target
   TransformUtils
